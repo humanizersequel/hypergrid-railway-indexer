@@ -1,0 +1,22 @@
+{
+  "name": "hypergrid-payment-tracker",
+  "version": "1.0.0",
+  "description": "Tracks USDC payments to Hypergrid providers from Hypermap TBAs",
+  "main": "payment-tracker.js",
+  "type": "module",
+  "scripts": {
+    "start": "node payment-tracker.js",
+    "setup-db": "psql $PAYMENTS_DATABASE_URL < setup-payments-db.sql",
+    "test-run": "node payment-tracker.js --test",
+    "daemon": "node payment-tracker.js --daemon"
+  },
+  "dependencies": {
+    "pg": "^8.11.5",
+    "node-fetch": "^3.3.2",
+    "web3": "^4.8.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
