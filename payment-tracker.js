@@ -118,16 +118,36 @@ async function fetchUsdcTransactions(walletAddress, fromBlock = 0) {
     }
 }
 
-async function processProviderTransactions(provider, tbaLookup, paymentsDb) {
-    const lastBlockResult = await paymentsDb.query(`
-        SELECT MAX(block_number) as last_block 
-        FROM hypermap_transactions 
-        WHERE to_address = $1
-    `, [provider.wallet_address]);
+async function getProviderCurrentStats(paymentsDb, provider) {
+    const result = await paymentsDb.query(`
+        SELECT 
+            last_processed_block,
+            total_usdc_received,
+            transaction_count,
+            unique_sender_count,
+            first_transaction_at,
+            last_transaction_at
+        FROM provider_leaderboard
+        WHERE provider_entry_namehash = $1
+    `, [provider.namehash]);
     
-    const fromBlock = lastBlockResult.rows[0].last_block 
-        ? lastBlockResult.rows[0].last_block + 1 
-        : 0;
+    if (result.rows.length > 0) {
+        return result.rows[0];
+    }
+    
+    return {
+        last_processed_block: 0,
+        total_usdc_received: 0,
+        transaction_count: 0,
+        unique_sender_count: 0,
+        first_transaction_at: null,
+        last_transaction_at: null
+    };
+}
+
+async function processProviderTransactions(provider, tbaLookup, paymentsDb) {
+    const currentStats = await getProviderCurrentStats(paymentsDb, provider);
+    const fromBlock = currentStats.last_processed_block + 1;
     
     const transactions = await fetchUsdcTransactions(
         provider.wallet_address, 
@@ -154,7 +174,11 @@ async function processProviderTransactions(provider, tbaLookup, paymentsDb) {
         }
     }
     
-    return validTransactions;
+    const lastBlock = transactions.length > 0 
+        ? Math.max(...transactions.map(tx => parseInt(tx.blockNumber)))
+        : fromBlock;
+    
+    return { validTransactions, lastBlock };
 }
 
 async function updatePaymentRecords(paymentsDb, provider, validTransactions) {
@@ -178,36 +202,81 @@ async function updatePaymentRecords(paymentsDb, provider, validTransactions) {
             ]);
         }
         
-        const stats = await client.query(`
-            SELECT 
-                COUNT(*) as tx_count,
-                SUM(value_usdc) as total_usdc,
-                COUNT(DISTINCT from_address) as unique_senders,
-                MIN(timestamp) as first_tx,
-                MAX(timestamp) as last_tx
-            FROM hypermap_transactions
-            WHERE to_address = $1
-        `, [provider.wallet_address]);
+        await client.query('COMMIT');
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+async function updateLastProcessedBlock(paymentsDb, provider, lastBlock) {
+    await paymentsDb.query(`
+        INSERT INTO provider_leaderboard (
+            provider_entry_namehash, provider_entry_name, provider_id,
+            wallet_address, total_usdc_received, transaction_count,
+            unique_sender_count, last_processed_block
+        ) VALUES ($1, $2, $3, $4, 0, 0, 0, $5)
+        ON CONFLICT (provider_entry_namehash) DO UPDATE SET
+            last_processed_block = EXCLUDED.last_processed_block,
+            updated_at = NOW()
+    `, [
+        provider.namehash, provider.full_name, provider.provider_id,
+        provider.wallet_address, lastBlock
+    ]);
+}
+
+async function updateLeaderboardStatsIncremental(paymentsDb, provider, newTransactions, lastBlock) {
+    const client = await paymentsDb.connect();
+    
+    try {
+        await client.query('BEGIN');
         
-        const { tx_count, total_usdc, unique_senders, first_tx, last_tx } = stats.rows[0];
+        const currentStats = await getProviderCurrentStats(paymentsDb, provider);
+        
+        const newTotalUsdc = newTransactions.reduce((sum, tx) => sum + tx.valueUsdc, 0);
+        const newTxCount = newTransactions.length;
+        
+        const uniqueNewSenders = [...new Set(newTransactions.map(tx => tx.fromAddress.toLowerCase()))];
+        
+        let newUniqueSenderCount = currentStats.unique_sender_count;
+        if (uniqueNewSenders.length > 0) {
+            const existingSendersResult = await client.query(`
+                SELECT COUNT(DISTINCT from_address) as existing_count
+                FROM hypermap_transactions
+                WHERE to_address = $1
+                AND from_address = ANY($2)
+                AND block_number < $3
+            `, [provider.wallet_address, uniqueNewSenders, newTransactions[0].blockNumber]);
+            
+            const existingCount = parseInt(existingSendersResult.rows[0].existing_count) || 0;
+            const actuallyNewSenders = uniqueNewSenders.length - existingCount;
+            newUniqueSenderCount = currentStats.unique_sender_count + actuallyNewSenders;
+        }
+        
+        const firstTx = currentStats.first_transaction_at || newTransactions[0]?.timestamp;
+        const lastTx = newTransactions[newTransactions.length - 1]?.timestamp || currentStats.last_transaction_at;
         
         await client.query(`
             INSERT INTO provider_leaderboard (
                 provider_entry_namehash, provider_entry_name, provider_id,
                 wallet_address, total_usdc_received, transaction_count,
-                unique_sender_count, first_transaction_at, last_transaction_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                unique_sender_count, first_transaction_at, last_transaction_at,
+                last_processed_block
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (provider_entry_namehash) DO UPDATE SET
-                total_usdc_received = $5,
-                transaction_count = $6,
+                total_usdc_received = provider_leaderboard.total_usdc_received + EXCLUDED.total_usdc_received,
+                transaction_count = provider_leaderboard.transaction_count + EXCLUDED.transaction_count,
                 unique_sender_count = $7,
-                first_transaction_at = $8,
-                last_transaction_at = $9,
+                first_transaction_at = COALESCE(provider_leaderboard.first_transaction_at, EXCLUDED.first_transaction_at),
+                last_transaction_at = GREATEST(provider_leaderboard.last_transaction_at, EXCLUDED.last_transaction_at),
+                last_processed_block = EXCLUDED.last_processed_block,
                 updated_at = NOW()
         `, [
             provider.namehash, provider.full_name, provider.provider_id,
-            provider.wallet_address, total_usdc || 0, tx_count || 0,
-            unique_senders || 0, first_tx, last_tx
+            provider.wallet_address, newTotalUsdc, newTxCount,
+            newUniqueSenderCount, firstTx, lastTx, lastBlock
         ]);
         
         await client.query('COMMIT');
@@ -243,7 +312,7 @@ async function runPaymentTracker() {
             try {
                 console.log(`Processing provider ${provider.provider_id} (${provider.full_name})...`);
                 
-                const validTransactions = await processProviderTransactions(
+                const { validTransactions, lastBlock } = await processProviderTransactions(
                     provider, 
                     tbaLookup, 
                     paymentsDb
@@ -251,8 +320,10 @@ async function runPaymentTracker() {
                 
                 if (validTransactions.length > 0) {
                     await updatePaymentRecords(paymentsDb, provider, validTransactions);
+                    await updateLeaderboardStatsIncremental(paymentsDb, provider, validTransactions, lastBlock);
                     console.log(`Processed ${validTransactions.length} transactions for ${provider.provider_id}`);
                 } else {
+                    await updateLastProcessedBlock(paymentsDb, provider, lastBlock);
                     console.log(`No new transactions for ${provider.provider_id}`);
                 }
                 
