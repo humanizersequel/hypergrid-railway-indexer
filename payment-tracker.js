@@ -8,10 +8,11 @@ config();
 
 const INDEXER_DATABASE_URL = process.env.INDEXER_DATABASE_URL;
 const PAYMENTS_DATABASE_URL = process.env.PAYMENTS_DATABASE_URL;
-const BASESCAN_API_KEY = process.env.BASESCAN_API_KEY;
+const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '600000');
 const USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS || '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
-const BASESCAN_API_URL = process.env.BASESCAN_API_URL || 'https://api.basescan.org/api';
+const ETHERSCAN_API_URL = process.env.ETHERSCAN_API_URL || 'https://api.etherscan.io/v2/api';
+const BASE_CHAIN_ID = process.env.BASE_CHAIN_ID || '8453';
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3');
 const RETRY_DELAY_MS = parseInt(process.env.RETRY_DELAY_MS || '5000');
 
@@ -84,14 +85,15 @@ async function buildTbaLookup(indexerDb) {
 }
 
 async function fetchUsdcTransactions(walletAddress, fromBlock = 0) {
-    const url = new URL(BASESCAN_API_URL);
+    const url = new URL(ETHERSCAN_API_URL);
     url.searchParams.append('module', 'account');
     url.searchParams.append('action', 'tokentx');
+    url.searchParams.append('chainid', BASE_CHAIN_ID);
     url.searchParams.append('address', walletAddress);
     url.searchParams.append('contractaddress', USDC_CONTRACT_ADDRESS);
     url.searchParams.append('startblock', fromBlock);
     url.searchParams.append('sort', 'asc');
-    url.searchParams.append('apikey', BASESCAN_API_KEY);
+    url.searchParams.append('apikey', ETHERSCAN_API_KEY);
     
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
