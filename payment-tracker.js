@@ -15,6 +15,8 @@ const ETHERSCAN_API_URL = process.env.ETHERSCAN_API_URL || 'https://api.ethersca
 const BASE_CHAIN_ID = process.env.BASE_CHAIN_ID || '8453';
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3');
 const RETRY_DELAY_MS = parseInt(process.env.RETRY_DELAY_MS || '5000');
+const BLOCK_SAFETY_BUFFER = parseInt(process.env.BLOCK_SAFETY_BUFFER || '10'); // Process blocks at least 10 blocks old
+const CONSERVATIVE_BLOCK_ADVANCE = parseInt(process.env.CONSERVATIVE_BLOCK_ADVANCE || '100'); // Max blocks to advance when no transactions found
 
 async function findGridBetaHyprNamehash(indexerDb) {
     const hyprResult = await indexerDb.query(`
@@ -84,7 +86,31 @@ async function buildTbaLookup(indexerDb) {
     return tbaMap;
 }
 
-async function fetchUsdcTransactions(walletAddress, fromBlock = 0) {
+async function getCurrentBlockHeight() {
+    const url = new URL(ETHERSCAN_API_URL);
+    url.searchParams.append('module', 'proxy');
+    url.searchParams.append('action', 'eth_blockNumber');
+    url.searchParams.append('chainid', BASE_CHAIN_ID);
+    url.searchParams.append('apikey', ETHERSCAN_API_KEY);
+    
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            const response = await fetch(url.toString());
+            const data = await response.json();
+            
+            if (data.result) {
+                return parseInt(data.result, 16); // Convert from hex to decimal
+            }
+            
+            throw new Error(data.message || 'Failed to get block height');
+        } catch (error) {
+            if (attempt === MAX_RETRIES) throw error;
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        }
+    }
+}
+
+async function fetchUsdcTransactions(walletAddress, fromBlock = 0, endBlock = 999999999) {
     const url = new URL(ETHERSCAN_API_URL);
     url.searchParams.append('module', 'account');
     url.searchParams.append('action', 'tokentx');
@@ -92,6 +118,7 @@ async function fetchUsdcTransactions(walletAddress, fromBlock = 0) {
     url.searchParams.append('address', walletAddress);
     url.searchParams.append('contractaddress', USDC_CONTRACT_ADDRESS);
     url.searchParams.append('startblock', fromBlock);
+    url.searchParams.append('endblock', endBlock);
     url.searchParams.append('sort', 'asc');
     url.searchParams.append('apikey', ETHERSCAN_API_KEY);
     
@@ -106,11 +133,11 @@ async function fetchUsdcTransactions(walletAddress, fromBlock = 0) {
                 );
             }
             
-            if (data.status === '0' && data.result === 'No transactions found') {
+            if (data.status === '0' && (data.message === 'No transactions found' || data.result === 'No transactions found')) {
                 return [];
             }
             
-            throw new Error(data.message || 'API request failed');
+            throw new Error(data.message || data.result || 'API request failed');
         } catch (error) {
             if (attempt === MAX_RETRIES) throw error;
             await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
@@ -145,24 +172,57 @@ async function getProviderCurrentStats(paymentsDb, provider) {
     };
 }
 
-async function processProviderTransactions(provider, tbaLookup, paymentsDb) {
+async function processProviderTransactions(provider, tbaLookup, paymentsDb, safeBlockHeight) {
     const currentStats = await getProviderCurrentStats(paymentsDb, provider);
     const fromBlock = currentStats.last_processed_block + 1;
     
+    // Don't process beyond the safe block height
+    if (fromBlock > safeBlockHeight) {
+        console.log(`Provider ${provider.provider_id} is ahead of safe block height (${fromBlock} > ${safeBlockHeight}), skipping`);
+        return { 
+            validTransactions: [], 
+            lastProcessedBlock: currentStats.last_processed_block,
+            reachedSafeHeight: false 
+        };
+    }
+    
     const transactions = await fetchUsdcTransactions(
         provider.wallet_address, 
-        fromBlock
+        fromBlock,
+        safeBlockHeight
     );
     
     const validTransactions = [];
-    for (const tx of transactions) {
+    let maxBlockSeen = fromBlock - 1; // Start with the last processed block
+    
+    // Sort transactions by block number to ensure proper ordering
+    const sortedTransactions = transactions.sort((a, b) => 
+        parseInt(a.blockNumber) - parseInt(b.blockNumber)
+    );
+    
+    for (const tx of sortedTransactions) {
+        const blockNumber = parseInt(tx.blockNumber);
+        
+        // Skip transactions beyond our safe height
+        if (blockNumber > safeBlockHeight) {
+            continue;
+        }
+        
+        // Validate we're not going backwards in blocks
+        if (blockNumber < fromBlock) {
+            console.warn(`Transaction ${tx.hash} has block ${blockNumber} which is before our fromBlock ${fromBlock}, skipping`);
+            continue;
+        }
+        
+        maxBlockSeen = Math.max(maxBlockSeen, blockNumber);
+        
         const fromAddress = tx.from.toLowerCase();
         const tbaInfo = tbaLookup.get(fromAddress);
         
         if (tbaInfo) {
             validTransactions.push({
                 txHash: tx.hash,
-                blockNumber: parseInt(tx.blockNumber),
+                blockNumber: blockNumber,
                 timestamp: new Date(parseInt(tx.timeStamp) * 1000),
                 fromAddress: tx.from,
                 fromHypermapName: tbaInfo.fullName,
@@ -174,11 +234,26 @@ async function processProviderTransactions(provider, tbaLookup, paymentsDb) {
         }
     }
     
-    const lastBlock = transactions.length > 0 
-        ? Math.max(...transactions.map(tx => parseInt(tx.blockNumber)))
-        : fromBlock;
+    // Determine how far to advance the block pointer
+    let lastProcessedBlock;
+    if (transactions.length === 0) {
+        // No transactions found. To be safe, only advance by a conservative amount
+        // This prevents missing transactions that might not be indexed yet
+        const conservativeAdvance = Math.min(
+            fromBlock + CONSERVATIVE_BLOCK_ADVANCE, // Advance conservatively when no txs found
+            safeBlockHeight
+        );
+        lastProcessedBlock = conservativeAdvance;
+        console.log(`No transactions found for ${provider.provider_id} from block ${fromBlock}, conservatively advancing to ${lastProcessedBlock}`);
+    } else {
+        // We found some transactions, only advance to the highest block we've seen
+        lastProcessedBlock = Math.min(maxBlockSeen, safeBlockHeight);
+        console.log(`Found ${validTransactions.length} valid transactions for ${provider.provider_id}, advancing to block ${lastProcessedBlock}`);
+    }
     
-    return { validTransactions, lastBlock };
+    const reachedSafeHeight = lastProcessedBlock >= safeBlockHeight;
+    
+    return { validTransactions, lastProcessedBlock, reachedSafeHeight };
 }
 
 async function updatePaymentRecords(paymentsDb, provider, validTransactions) {
@@ -192,13 +267,13 @@ async function updatePaymentRecords(paymentsDb, provider, validTransactions) {
                 INSERT INTO hypermap_transactions (
                     tx_hash, block_number, timestamp, from_address,
                     from_hypermap_name, to_address, to_provider_id,
-                    value_usdc, gas_used
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    provider_entry_name, value_usdc, gas_used
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (tx_hash) DO NOTHING
             `, [
                 tx.txHash, tx.blockNumber, tx.timestamp, tx.fromAddress,
                 tx.fromHypermapName, tx.toAddress, tx.toProviderId,
-                tx.valueUsdc, tx.gasUsed
+                provider.full_name, tx.valueUsdc, tx.gasUsed
             ]);
         }
         
@@ -211,7 +286,7 @@ async function updatePaymentRecords(paymentsDb, provider, validTransactions) {
     }
 }
 
-async function updateLastProcessedBlock(paymentsDb, provider, lastBlock) {
+async function updateLastProcessedBlock(paymentsDb, provider, lastProcessedBlock) {
     await paymentsDb.query(`
         INSERT INTO provider_leaderboard (
             provider_entry_namehash, provider_entry_name, provider_id,
@@ -223,11 +298,11 @@ async function updateLastProcessedBlock(paymentsDb, provider, lastBlock) {
             updated_at = NOW()
     `, [
         provider.namehash, provider.full_name, provider.provider_id,
-        provider.wallet_address, lastBlock
+        provider.wallet_address, lastProcessedBlock
     ]);
 }
 
-async function updateLeaderboardStatsIncremental(paymentsDb, provider, newTransactions, lastBlock) {
+async function updateLeaderboardStatsIncremental(paymentsDb, provider, newTransactions, lastProcessedBlock) {
     const client = await paymentsDb.connect();
     
     try {
@@ -276,7 +351,7 @@ async function updateLeaderboardStatsIncremental(paymentsDb, provider, newTransa
         `, [
             provider.namehash, provider.full_name, provider.provider_id,
             provider.wallet_address, newTotalUsdc, newTxCount,
-            newUniqueSenderCount, firstTx, lastTx, lastBlock
+            newUniqueSenderCount, firstTx, lastTx, lastProcessedBlock
         ]);
         
         await client.query('COMMIT');
@@ -308,23 +383,32 @@ async function runPaymentTracker() {
         const tbaLookup = await buildTbaLookup(indexerDb);
         console.log(`Loaded ${tbaLookup.size} TBA addresses`);
         
+        // Get current block height and calculate safe block height
+        const currentBlockHeight = await getCurrentBlockHeight();
+        const safeBlockHeight = currentBlockHeight - BLOCK_SAFETY_BUFFER;
+        console.log(`Current block height: ${currentBlockHeight}, processing up to block: ${safeBlockHeight}`);
+        
         for (const provider of providers) {
             try {
                 console.log(`Processing provider ${provider.provider_id} (${provider.full_name})...`);
                 
-                const { validTransactions, lastBlock } = await processProviderTransactions(
+                const { validTransactions, lastProcessedBlock, reachedSafeHeight } = await processProviderTransactions(
                     provider, 
                     tbaLookup, 
-                    paymentsDb
+                    paymentsDb,
+                    safeBlockHeight
                 );
                 
                 if (validTransactions.length > 0) {
                     await updatePaymentRecords(paymentsDb, provider, validTransactions);
-                    await updateLeaderboardStatsIncremental(paymentsDb, provider, validTransactions, lastBlock);
-                    console.log(`Processed ${validTransactions.length} transactions for ${provider.provider_id}`);
+                    await updateLeaderboardStatsIncremental(paymentsDb, provider, validTransactions, lastProcessedBlock);
+                    console.log(`Processed ${validTransactions.length} transactions for ${provider.provider_id}, last block: ${lastProcessedBlock}`);
+                } else if (reachedSafeHeight) {
+                    // Only update the block if we've actually scanned up to the safe height
+                    await updateLastProcessedBlock(paymentsDb, provider, lastProcessedBlock);
+                    console.log(`No new transactions for ${provider.provider_id}, updated to block: ${lastProcessedBlock}`);
                 } else {
-                    await updateLastProcessedBlock(paymentsDb, provider, lastBlock);
-                    console.log(`No new transactions for ${provider.provider_id}`);
+                    console.log(`Provider ${provider.provider_id} is already up to date (block ${lastProcessedBlock})`);
                 }
                 
                 await new Promise(resolve => setTimeout(resolve, 1000));
