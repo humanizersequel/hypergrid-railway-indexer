@@ -6,8 +6,6 @@
   "type": "module",
   "scripts": {
     "start": "node payment-tracker.js",
-    "setup-db": "psql $PAYMENTS_DATABASE_URL < setup-payments-db.sql",
-    "test-run": "node payment-tracker.js --test",
     "daemon": "node payment-tracker.js --daemon"
   },
   "dependencies": {
