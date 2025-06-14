@@ -1,6 +1,7 @@
 import pg from 'pg';
 import fetch from 'node-fetch';
 import { config } from 'dotenv';
+import crypto from 'crypto';
 
 const { Pool } = pg;
 
@@ -117,8 +118,8 @@ async function fetchUsdcTransactions(walletAddress, fromBlock = 0, endBlock = 99
     url.searchParams.append('chainid', BASE_CHAIN_ID);
     url.searchParams.append('address', walletAddress);
     url.searchParams.append('contractaddress', USDC_CONTRACT_ADDRESS);
-    url.searchParams.append('startblock', fromBlock);
-    url.searchParams.append('endblock', endBlock);
+    url.searchParams.append('startblock', fromBlock.toString());
+    url.searchParams.append('endblock', endBlock.toString());
     url.searchParams.append('sort', 'asc');
     url.searchParams.append('apikey', ETHERSCAN_API_KEY);
     
@@ -153,13 +154,28 @@ async function getProviderCurrentStats(paymentsDb, provider) {
             transaction_count,
             unique_sender_count,
             first_transaction_at,
-            last_transaction_at
+            last_transaction_at,
+            last_transaction_block,
+            processing_checkpoint,
+            state_validation_hash
         FROM provider_leaderboard
         WHERE provider_entry_namehash = $1
     `, [provider.namehash]);
     
     if (result.rows.length > 0) {
-        return result.rows[0];
+        const stats = result.rows[0];
+        // Ensure all numeric fields are properly parsed as integers
+        return {
+            last_processed_block: parseInt(stats.last_processed_block) || 0,
+            total_usdc_received: parseFloat(stats.total_usdc_received) || 0,
+            transaction_count: parseInt(stats.transaction_count) || 0,
+            unique_sender_count: parseInt(stats.unique_sender_count) || 0,
+            first_transaction_at: stats.first_transaction_at,
+            last_transaction_at: stats.last_transaction_at,
+            last_transaction_block: parseInt(stats.last_transaction_block) || 0,
+            processing_checkpoint: parseInt(stats.processing_checkpoint) || 0,
+            state_validation_hash: stats.state_validation_hash
+        };
     }
     
     return {
@@ -168,17 +184,69 @@ async function getProviderCurrentStats(paymentsDb, provider) {
         transaction_count: 0,
         unique_sender_count: 0,
         first_transaction_at: null,
-        last_transaction_at: null
+        last_transaction_at: null,
+        last_transaction_block: 0,
+        processing_checkpoint: 0,
+        state_validation_hash: null
     };
+}
+
+async function validateAndFixBlockNumber(blockNumber, currentHeight, providerName) {
+    const block = parseInt(blockNumber) || 0;
+    
+    // Check for corruption patterns
+    if (block > currentHeight + 1000) {
+        console.warn(`CORRUPTION DETECTED: Provider ${providerName} has block ${block} but current height is ${currentHeight}`);
+        
+        // Try to fix by removing last digit if it looks like string concatenation
+        if (block > 100000000) {
+            const fixed = Math.floor(block / 10);
+            console.log(`Attempting to fix: ${block} -> ${fixed}`);
+            return fixed;
+        }
+        
+        // Otherwise cap at current height
+        return currentHeight;
+    }
+    
+    return block;
+}
+
+async function logBlockChange(paymentsDb, provider, oldBlock, newBlock, changeType) {
+    try {
+        await paymentsDb.query(`
+            INSERT INTO block_processing_log 
+            (provider_entry_namehash, provider_entry_name, old_block_number, new_block_number, change_type)
+            VALUES ($1, $2, $3, $4, $5)
+        `, [provider.namehash, provider.full_name, oldBlock, newBlock, changeType]);
+    } catch (error) {
+        console.error('Failed to log block change:', error);
+    }
 }
 
 async function processProviderTransactions(provider, tbaLookup, paymentsDb, safeBlockHeight) {
     const currentStats = await getProviderCurrentStats(paymentsDb, provider);
-    const fromBlock = currentStats.last_processed_block + 1;
+    
+    // Validate and potentially fix the last processed block
+    const validatedLastBlock = await validateAndFixBlockNumber(
+        currentStats.last_processed_block, 
+        safeBlockHeight, 
+        provider.full_name
+    );
+    
+    // If we had to fix corruption, update the database
+    if (validatedLastBlock !== currentStats.last_processed_block) {
+        console.log(`Fixing corrupted block for ${provider.full_name}: ${currentStats.last_processed_block} -> ${validatedLastBlock}`);
+        await updateLastProcessedBlock(paymentsDb, provider, validatedLastBlock);
+        await logBlockChange(paymentsDb, provider, currentStats.last_processed_block, validatedLastBlock, 'corruption_fix');
+        currentStats.last_processed_block = validatedLastBlock;
+    }
+    
+    const fromBlock = parseInt(currentStats.last_processed_block) + 1;
     
     // Don't process beyond the safe block height
     if (fromBlock > safeBlockHeight) {
-        console.log(`Provider ${provider.provider_id} is ahead of safe block height (${fromBlock} > ${safeBlockHeight}), skipping`);
+        console.log(`Provider ${provider.full_name} is at block ${currentStats.last_processed_block}, waiting for safe height ${safeBlockHeight}`);
         return { 
             validTransactions: [], 
             lastProcessedBlock: currentStats.last_processed_block,
@@ -244,11 +312,13 @@ async function processProviderTransactions(provider, tbaLookup, paymentsDb, safe
             safeBlockHeight
         );
         lastProcessedBlock = conservativeAdvance;
-        console.log(`No transactions found for ${provider.provider_id} from block ${fromBlock}, conservatively advancing to ${lastProcessedBlock}`);
+        console.log(`No transactions found for ${provider.full_name} from block ${fromBlock}, conservatively advancing to ${lastProcessedBlock}`);
+        await logBlockChange(paymentsDb, provider, currentStats.last_processed_block, lastProcessedBlock, 'conservative_advance');
     } else {
         // We found some transactions, only advance to the highest block we've seen
         lastProcessedBlock = Math.min(maxBlockSeen, safeBlockHeight);
-        console.log(`Found ${validTransactions.length} valid transactions for ${provider.provider_id}, advancing to block ${lastProcessedBlock}`);
+        console.log(`Found ${validTransactions.length} valid transactions for ${provider.full_name}, advancing to block ${lastProcessedBlock}`);
+        await logBlockChange(paymentsDb, provider, currentStats.last_processed_block, lastProcessedBlock, 'normal_advance');
     }
     
     const reachedSafeHeight = lastProcessedBlock >= safeBlockHeight;
@@ -287,18 +357,36 @@ async function updatePaymentRecords(paymentsDb, provider, validTransactions) {
 }
 
 async function updateLastProcessedBlock(paymentsDb, provider, lastProcessedBlock) {
+    // Ensure block number is an integer
+    const safeBlockNumber = parseInt(lastProcessedBlock) || 0;
+    
+    // Double-check for sanity
+    if (safeBlockNumber > 100000000) {
+        throw new Error(`Refusing to set unreasonable block number: ${safeBlockNumber}`);
+    }
+    
+    const stateHash = require('crypto').createHash('md5')
+        .update(`${safeBlockNumber}|${provider.namehash}`)
+        .digest('hex');
+    
     await paymentsDb.query(`
         INSERT INTO provider_leaderboard (
             provider_entry_namehash, provider_entry_name, provider_id,
             wallet_address, total_usdc_received, transaction_count,
-            unique_sender_count, last_processed_block
-        ) VALUES ($1, $2, $3, $4, 0, 0, 0, $5)
+            unique_sender_count, last_processed_block, processing_checkpoint,
+            state_validation_hash
+        ) VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5, $6)
         ON CONFLICT (provider_entry_namehash) DO UPDATE SET
             last_processed_block = EXCLUDED.last_processed_block,
+            processing_checkpoint = GREATEST(
+                provider_leaderboard.processing_checkpoint, 
+                EXCLUDED.last_processed_block - 1000
+            ),
+            state_validation_hash = EXCLUDED.state_validation_hash,
             updated_at = NOW()
     `, [
         provider.namehash, provider.full_name, provider.provider_id,
-        provider.wallet_address, lastProcessedBlock
+        provider.wallet_address, safeBlockNumber, stateHash
     ]);
 }
 
@@ -338,8 +426,8 @@ async function updateLeaderboardStatsIncremental(paymentsDb, provider, newTransa
                 provider_entry_namehash, provider_entry_name, provider_id,
                 wallet_address, total_usdc_received, transaction_count,
                 unique_sender_count, first_transaction_at, last_transaction_at,
-                last_processed_block
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                last_processed_block, last_transaction_block, state_validation_hash
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (provider_entry_namehash) DO UPDATE SET
                 total_usdc_received = provider_leaderboard.total_usdc_received + EXCLUDED.total_usdc_received,
                 transaction_count = provider_leaderboard.transaction_count + EXCLUDED.transaction_count,
@@ -347,11 +435,22 @@ async function updateLeaderboardStatsIncremental(paymentsDb, provider, newTransa
                 first_transaction_at = COALESCE(provider_leaderboard.first_transaction_at, EXCLUDED.first_transaction_at),
                 last_transaction_at = GREATEST(provider_leaderboard.last_transaction_at, EXCLUDED.last_transaction_at),
                 last_processed_block = EXCLUDED.last_processed_block,
+                last_transaction_block = EXCLUDED.last_transaction_block,
+                processing_checkpoint = GREATEST(
+                    provider_leaderboard.processing_checkpoint,
+                    EXCLUDED.last_processed_block - 1000
+                ),
+                state_validation_hash = EXCLUDED.state_validation_hash,
                 updated_at = NOW()
         `, [
             provider.namehash, provider.full_name, provider.provider_id,
             provider.wallet_address, newTotalUsdc, newTxCount,
-            newUniqueSenderCount, firstTx, lastTx, lastProcessedBlock
+            newUniqueSenderCount, firstTx, lastTx, 
+            parseInt(lastProcessedBlock) || 0,  // Ensure integer
+            parseInt(lastProcessedBlock) || 0,  // last_transaction_block
+            crypto.createHash('md5')
+                .update(`${lastProcessedBlock}|${newTotalUsdc}|${currentStats.transaction_count + newTxCount}`)
+                .digest('hex')
         ]);
         
         await client.query('COMMIT');
@@ -386,11 +485,16 @@ async function runPaymentTracker() {
         // Get current block height and calculate safe block height
         const currentBlockHeight = await getCurrentBlockHeight();
         const safeBlockHeight = currentBlockHeight - BLOCK_SAFETY_BUFFER;
-        console.log(`Current block height: ${currentBlockHeight}, processing up to block: ${safeBlockHeight}`);
+        console.log(`\n=== Payment Tracker Run Started ===`);
+        console.log(`Current blockchain height: ${currentBlockHeight}`);
+        console.log(`Safe processing height: ${safeBlockHeight} (${BLOCK_SAFETY_BUFFER} blocks behind)`);
+        console.log(`Time: ${new Date().toISOString()}`);
         
         for (const provider of providers) {
             try {
-                console.log(`Processing provider ${provider.provider_id} (${provider.full_name})...`);
+                console.log(`\nProcessing provider: ${provider.full_name}`);
+                console.log(`  Wallet: ${provider.wallet_address}`);
+                console.log(`  Current block: ${currentStats.last_processed_block}`);
                 
                 const { validTransactions, lastProcessedBlock, reachedSafeHeight } = await processProviderTransactions(
                     provider, 
@@ -402,19 +506,27 @@ async function runPaymentTracker() {
                 if (validTransactions.length > 0) {
                     await updatePaymentRecords(paymentsDb, provider, validTransactions);
                     await updateLeaderboardStatsIncremental(paymentsDb, provider, validTransactions, lastProcessedBlock);
-                    console.log(`Processed ${validTransactions.length} transactions for ${provider.provider_id}, last block: ${lastProcessedBlock}`);
+                    console.log(`✓ Processed ${validTransactions.length} transactions for ${provider.full_name}`);
+                    console.log(`  Advanced from block ${currentStats.last_processed_block} to ${lastProcessedBlock}`);
                 } else if (reachedSafeHeight) {
                     // Only update the block if we've actually scanned up to the safe height
                     await updateLastProcessedBlock(paymentsDb, provider, lastProcessedBlock);
-                    console.log(`No new transactions for ${provider.provider_id}, updated to block: ${lastProcessedBlock}`);
+                    console.log(`✓ No new transactions for ${provider.full_name}`);
+                    console.log(`  Advanced from block ${currentStats.last_processed_block} to ${lastProcessedBlock}`);
                 } else {
-                    console.log(`Provider ${provider.provider_id} is already up to date (block ${lastProcessedBlock})`);
+                    console.log(`✓ ${provider.full_name} is already up to date at block ${lastProcessedBlock}`);
                 }
                 
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 
             } catch (error) {
-                console.error(`Error processing provider ${provider.provider_id}:`, error);
+                console.error(`Error processing provider ${provider.full_name}:`, error);
+                // Log the error for tracking
+                await paymentsDb.query(`
+                    UPDATE tracker_state 
+                    SET last_error = $1
+                    WHERE id = 1
+                `, [`Provider ${provider.full_name}: ${error.message}`]);
             }
         }
         
@@ -426,10 +538,14 @@ async function runPaymentTracker() {
             WHERE id = 1
         `);
         
-        console.log('Payment tracker run completed successfully');
+        console.log(`\n=== Payment Tracker Run Completed ===`);
+        console.log(`Time: ${new Date().toISOString()}`);
+        console.log('Status: SUCCESS');
         
     } catch (error) {
-        console.error('Payment tracker error:', error);
+        console.error('\n=== Payment Tracker Error ===');
+        console.error('Time:', new Date().toISOString());
+        console.error('Error:', error);
         
         await paymentsDb.query(`
             UPDATE tracker_state 
