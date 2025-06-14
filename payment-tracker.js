@@ -233,7 +233,8 @@ async function runPaymentTracker() {
         
         console.log(`Updated ${updateResult.rowCount} providers`);
         for (const row of updateResult.rows) {
-            console.log(`  ${row.provider_entry_name}: ${row.transaction_count} txs, $${row.total_usdc_received.toFixed(2)} USDC`);
+            const usdcAmount = parseFloat(row.total_usdc_received) || 0;
+            console.log(`  ${row.provider_entry_name}: ${row.transaction_count} txs, $${usdcAmount.toFixed(2)} USDC`);
         }
         
         console.log(`\nProcessed blocks ${fromBlock} to ${toBlock}`);
