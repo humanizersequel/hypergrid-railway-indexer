@@ -142,7 +142,7 @@ async function runPaymentTracker() {
                     unique_sender_count
                 ) VALUES ($1, $2, $3, $4, 0, 0, 0)
                 ON CONFLICT (provider_entry_namehash) DO NOTHING
-            `, [provider.namehash, provider.full_name, provider.provider_id, provider.wallet_address]);
+            `, [provider.namehash, provider.full_name, provider.provider_id, provider.wallet_address.toLowerCase()]);
         }
         
         // Process each provider
@@ -175,9 +175,9 @@ async function runPaymentTracker() {
                             tx.hash,
                             parseInt(tx.blockNumber),
                             new Date(parseInt(tx.timeStamp) * 1000),
-                            tx.from,
+                            tx.from.toLowerCase(),
                             senderName,
-                            tx.to,
+                            tx.to.toLowerCase(),
                             provider.provider_id,
                             provider.full_name,
                             parseFloat(tx.value) / 1e6,
@@ -206,7 +206,8 @@ async function runPaymentTracker() {
         `, [toBlock]);
         
         // Update leaderboard
-        await paymentsDb.query(`
+        console.log('\nUpdating provider leaderboard...');
+        const updateResult = await paymentsDb.query(`
             UPDATE provider_leaderboard pl
             SET 
                 total_usdc_received = stats.total_usdc,
@@ -226,8 +227,14 @@ async function runPaymentTracker() {
                 FROM hypermap_transactions
                 GROUP BY to_address
             ) stats
-            WHERE pl.wallet_address = stats.to_address
+            WHERE LOWER(pl.wallet_address) = LOWER(stats.to_address)
+            RETURNING pl.provider_entry_name, pl.total_usdc_received, pl.transaction_count
         `);
+        
+        console.log(`Updated ${updateResult.rowCount} providers`);
+        for (const row of updateResult.rows) {
+            console.log(`  ${row.provider_entry_name}: ${row.transaction_count} txs, $${row.total_usdc_received.toFixed(2)} USDC`);
+        }
         
         console.log(`\nProcessed blocks ${fromBlock} to ${toBlock}`);
         console.log(`Added ${totalTransactions} new transactions`);
