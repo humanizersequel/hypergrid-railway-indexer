@@ -297,7 +297,8 @@ async function runPaymentTracker() {
         
         // Get current state within transaction
         const stateResult = await paymentsClient.query('SELECT last_processed_block FROM global_state WHERE id = 1');
-        const lastProcessedBlock = stateResult.rows[0]?.last_processed_block || 0;
+        const lastProcessedBlock = parseInt(stateResult.rows[0]?.last_processed_block || 0);
+        console.log(`Raw from DB: ${stateResult.rows[0]?.last_processed_block}, Parsed: ${lastProcessedBlock}`);
         
         // Get current blockchain height
         const currentHeight = await getCurrentBlockHeight();
@@ -431,7 +432,7 @@ async function runPaymentTracker() {
             UPDATE global_state 
             SET last_processed_block = $1, updated_at = NOW() 
             WHERE id = 1
-        `, [toBlock]);
+        `, [parseInt(toBlock)]);
         
         // Update leaderboard
         console.log('\nUpdating provider leaderboard...');
