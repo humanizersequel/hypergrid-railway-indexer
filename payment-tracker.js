@@ -361,6 +361,7 @@ async function runPaymentTracker() {
         // Process each provider with batching
         const fromBlock = lastProcessedBlock + 1;
         const toBlock = safeHeight;
+        console.log(`Block range calculation: lastProcessedBlock=${lastProcessedBlock}, fromBlock=${fromBlock}, toBlock=${toBlock}`);
         let totalTransactions = 0;
         transactionBatch = []; // Reset batch
         
