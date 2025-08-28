@@ -333,7 +333,7 @@ async function runPaymentTracker() {
             SELECT LOWER(tba) as tba, full_name 
             FROM entries 
             WHERE tba IS NOT NULL
-            AND full_name LIKE '%.grid-wallet.%'
+            AND full_name LIKE 'grid-wallet.%'
         `);
         const tbaMap = new Map(tbaResult.rows.map(r => [r.tba, r.full_name]));
         
