@@ -13,5 +13,13 @@ RUN npm install --production
 # Copy the rest of the application code
 COPY . .
 
-# Command to run the application in daemon mode
-CMD ["node", "payment-tracker.js", "--daemon"]
+# Create non-root user for security
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S payment-tracker -u 1001
+
+# Change ownership of the app directory
+RUN chown -R payment-tracker:nodejs /app
+USER payment-tracker
+
+# Command to run the application in daemon mode with production optimizations
+CMD ["node", "--expose-gc", "payment-tracker.js", "--daemon"]
