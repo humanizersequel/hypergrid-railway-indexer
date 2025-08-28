@@ -326,7 +326,7 @@ async function runPaymentTracker() {
             WHERE e.parent_hash = $1
             AND wallet_note.interpreted_data IS NOT NULL
             AND provider_note.interpreted_data IS NOT NULL
-        `, [gridBetaHyprHash]);
+        `, [gridHyprHash]);
         
         // Get all grid-wallet TBAs for validation
         const tbaResult = await indexerClient.query(`
