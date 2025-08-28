@@ -191,25 +191,32 @@ async function fetchUsdcTransactions(address, fromBlock, toBlock) {
         url.searchParams.append('sort', 'asc');
         url.searchParams.append('apikey', ETHERSCAN_API_KEY);
         
+        console.log(`  API call: ${address} (blocks ${fromBlock}-${toBlock})`);
+        
         const response = await fetch(url.toString(), {
             timeout: 15000,
             headers: { 'User-Agent': 'Hypergrid-Payment-Tracker/1.0' }
         });
         
         if (!response.ok) {
+            console.error(`  API error: HTTP ${response.status}: ${response.statusText}`);
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         
         const data = await response.json();
         
         if (data.status === '1') {
+            console.log(`  API success: ${data.result?.length || 0} transactions found`);
             return data.result || [];
         } else if (data.message === 'No transactions found') {
+            console.log(`  API response: No transactions found`);
             return [];
         } else if (data.message && data.message.includes('rate limit')) {
+            console.error(`  API rate limit: ${data.message}`);
             throw new Error('Rate limit exceeded');
         }
         
+        console.error(`  API error: ${data.message || 'Unknown error'}`);
         throw new Error(data.message || 'API request failed');
     });
 }
